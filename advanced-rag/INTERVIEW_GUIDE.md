@@ -1,221 +1,260 @@
-# Interview Guide for Advanced RAG System
+# Interview Guide — Advanced RAG System
 
 ## 1. Complete request flow
 
-1. User enters a question in the Streamlit UI.
-2. The query transformer decomposes compound questions into focused subqueries.
-3. BM25 and vector retrieval are executed in parallel.
-4. Results are fused using Reciprocal Rank Fusion (RRF).
-5. The top candidates are reranked by a cross-encoder.
-6. A retrieval confidence grade is computed.
-7. If confidence is low, a corrective retrieval attempt is triggered.
-8. Extractive QA extracts a grounded answer span from reranked chunks.
-9. The UI displays the final answer, citations, and pipeline diagnostics.
+1. User enters a natural-language question in the Streamlit UI.
+2. **Query transformation** expands acronyms, corrects typos, normalises synonyms, and decomposes compound questions into focused subqueries.
+3. **BM25 retrieval** and **vector retrieval** run on each subquery.
+4. Results are merged via **Reciprocal Rank Fusion (RRF)**.
+5. A **cross-encoder reranker** scores the top-k fused candidates.
+6. **Composite confidence grading** evaluates retrieval quality using reranker scores, score margin, and BM25/vector retrieval agreement.
+7. If confidence is LOW or MEDIUM with ambiguous separation, **corrective retrieval** tries synonym expansion then query simplification.
+8. **Extractive QA** (roberta-base-squad2) extracts a grounded answer span. When confidence is HIGH/MEDIUM and span extraction fails, the top-ranked chunk is returned as a passage fallback.
+9. The UI renders the answer, confidence level with reason, per-stage latency, pipeline diagnostics, and interview explanations.
 
-## 2. Why not use only vector search?
+---
 
-- Vector search captures semantic similarity but can miss exact keyword matches.
-- It may return false positives when embeddings overgeneralize.
-- BM25 complements vector search with lexical precision.
-- Hybrid systems are more robust across varied query types.
+## 2. Why confidence scoring matters
 
-## 3. Why BM25?
+Confidence scoring is what separates a robust RAG system from a naive retrieve-and-generate pipeline.
 
-- BM25 is an effective lexical retrieval baseline.
-- It is fast, interpretable, and low-cost.
-- It excels at keyword-driven queries and exact phrase matching.
-- It provides a second signal that often improves precision.
+**Without confidence scoring:**
+- The system answers every query regardless of retrieval quality.
+- Low-quality retrieved documents produce incorrect or hallucinated answers.
+- There is no mechanism to detect retrieval failure at runtime.
 
-## 4. Why Hybrid Search?
+**With composite confidence scoring:**
+- The system can distinguish `(top_score=3.98, margin=14.19)` — clearly retrieved the right document — from `(top_score=1.20, margin=0.80)` — retrieval is ambiguous.
+- Retrieval agreement (did both BM25 and vector find this document?) provides a second, independent signal that increases confidence in multi-signal agreement cases.
+- The system can gate QA execution: only run the extractive model when evidence quality justifies it.
 
-- Combining BM25 and vector search leverages the strengths of both.
-- BM25 handles exact text matches; vector search handles semantics.
-- Hybrid retrieval reduces the risk of missing relevant content.
-- It improves recall without sacrificing relevancy.
+**Why averaging reranker scores is wrong:**
+Cross-encoder scores are not absolute probabilities. A highly relevant document might score +3.98 while irrelevant documents score -10 to -11. Averaging these produces a strongly negative confidence number even when retrieval was perfect. The correct signal is the top score (absolute relevance) and the score margin (relative certainty).
 
-## 5. Why RRF?
+---
 
-- Reciprocal Rank Fusion is a lightweight rank fusion method.
-- It combines rankings rather than raw scores from heterogeneous systems.
-- RRF is robust to score scale mismatches.
-- It boosts documents that are strong in both retrieval modalities.
+## 3. Why corrective retrieval exists
 
-## 6. Why Cross Encoder Reranking?
+Single-attempt retrieval is brittle. Corrective retrieval is the system's mechanism to recover gracefully:
 
-- Cross-encoders jointly encode query and candidate text for deeper interaction.
-- They outperform sparse and dense retrievers on final ranking quality.
-- They are used only for a short candidate list to limit latency.
-- They help suppress superficially similar but irrelevant results.
+**When does it trigger?**
+- `confidence_level == LOW`: the cross-encoder judges the best available document as irrelevant.
+- `score_margin < 1.0`: the top result is nearly tied with the second result — retrieval is ambiguous.
 
-## 7. Why Retrieval Grading?
+**What strategies does it try?**
+1. **Synonym expansion:** appends synonyms/related terms (`leave → vacation time off absence`). Broadens recall for queries with unusual vocabulary.
+2. **Query simplification:** strips stop words to focus on key nouns. Prevents stop words from diluting BM25 term matching.
 
-- Grading enables the system to detect low-confidence retrieval.
-- It makes the pipeline adaptive instead of one-shot.
-- It can trigger fallback paths when evidence is weak.
-- It supports safer answer extraction with grounded sources.
+**Why not always use the expanded query?**
+Expansion can hurt precision. Adding many synonyms can promote tangentially related documents. The system only adopts corrective results when they strictly improve the top reranker score.
 
-## 8. Why Corrective Retrieval?
+---
 
-- The first retrieval attempt may miss the best evidence.
-- Corrective retrieval broadens or expands the query when confidence is low.
-- It prevents premature or hallucinated answers.
-- It is a pragmatic tradeoff that improves robustness.
+## 4. Latency vs accuracy tradeoffs
 
-## 9. Why Extractive QA?
+| Component | Latency | Accuracy impact |
+|---|---|---|
+| BM25 retrieval | ~2–10 ms | High for keyword queries |
+| Vector retrieval | ~5–20 ms | High for semantic queries |
+| RRF fusion | <1 ms | Improves recall, no accuracy cost |
+| Cross-encoder reranking | ~30–200 ms | Largest accuracy gain per component |
+| Extractive QA | ~20–100 ms | Grounded answers, no hallucination |
 
-- Extractive QA returns a grounded text span from the source.
-- It avoids generating unsupported claims.
-- It is well-suited for factual QA over documents.
-- It provides an evidence-based answer with a confidence score.
+**The reranker is the latency bottleneck.** For production:
+- Replace cross-encoder with a distilled bi-encoder for ~10× speedup at ~5% accuracy cost.
+- Cache reranker results for repeated queries.
+- Use asynchronous reranking for non-latency-critical paths.
+- Limit the reranker candidate pool (RERANK_TOP_K) to control latency linearly.
 
-## 10. Why ChromaDB?
+---
 
-- ChromaDB is a lightweight local vector store.
-- It supports persistence and embedding-based similarity search.
-- It fits small-scale prototypes and proofs of concept.
-- It keeps the project local without external APIs.
+## 5. Retrieval vs reranking tradeoffs
 
-## 11. Latency analysis
+Retrieval (BM25 + vector) optimises for **recall** — it needs to surface the right document somewhere in the top-k results. Reranking optimises for **precision** — it identifies which of those candidates is actually most relevant.
 
-- Embedding generation is performed during ingestion, not query time.
-- BM25 retrieval is fast for small document collections.
-- Vector retrieval is efficient on ChromaDB for 10-20 documents.
-- Cross-encoder reranking is the largest latency contributor.
-- Corrective retrieval doubles retrieval work in low-confidence cases.
+This two-stage design is a deliberate engineering choice:
+- Running a cross-encoder over all documents would be prohibitively expensive (O(n) cross-encoder calls).
+- Running only BM25/vector produces noisy rankings that may not surface the best answer at position 1.
+- Retrieval + reranking gives the best precision at manageable latency.
 
-## 12. Memory analysis
+**The retrieve-then-rerank pattern** is the industry standard in production search systems (Google, Bing, Elasticsearch with learned ranking).
 
-- Models like SentenceTransformer and CrossEncoder load into RAM.
-- ChromaDB stores vectors on disk with in-memory acceleration.
-- For 20 documents, memory use is modest.
-- For larger collections, memory consumption grows with index size and model cache.
+---
 
-## 13. Production tradeoffs
+## 6. Failure modes
 
-- Local models are safer but more resource-intensive than API calls.
-- Hybrid retrieval improves accuracy but adds complexity.
-- Reranking boosts precision at the cost of extra compute.
-- Extractive QA is safer than generation but may fail when no answer exists.
-- Monitoring and logging become more important with more components.
+| Failure | Cause | Mitigation |
+|---|---|---|
+| Wrong document retrieved | Semantic drift in embeddings; BM25 keyword mismatch | Query transformation; corrective retrieval |
+| Correct document retrieved, wrong answer extracted | Question phrasing differs from document language | Fallback to full context chunk; lower span threshold |
+| Corrective retrieval makes things worse | Synonym expansion introduces noise | Only adopt if top_score strictly improves |
+| High confidence, wrong answer | Cross-encoder promotes superficially similar but off-topic content | Human evaluation; calibration of score thresholds |
+| Slow response | Large reranker candidate pool; slow embedding model | Reduce RERANK_TOP_K; use distilled models |
+| No answer for valid question | Document not in the corpus | Extend the document collection; monitor "no answer" rate |
 
-## 14. Failure modes
+---
 
-- The query transformer may split a question incorrectly.
-- BM25 may miss synonyms or paraphrases.
-- Vector retrieval may return semantically related but irrelevant passages.
-- Reranker may still promote a wrong candidate if the top candidates are poor.
-- Extractive QA may return an empty span or low-confidence answer.
+## 7. Scaling considerations
 
-## 15. Monitoring metrics
+**20 documents (this project):**
+- In-memory BM25, local ChromaDB, full cross-encoder reranking — no infrastructure needed.
 
-- Query latency: total and per-stage.
-- Candidate retrieval counts and scores.
-- Reranker average score and distribution.
-- QA confidence and answer fallback rates.
-- Corrective retrieval trigger rate.
+**1 million documents:**
+- BM25: persistent inverted index (Elasticsearch, OpenSearch, or Lucene).
+- Vector: approximate nearest neighbour index (HNSW via FAISS or Qdrant) — exact NN search is O(n).
+- Reranking: batch inference with GPU; limit to top-100 candidates from retrieval.
+- ChromaDB is no longer sufficient — use a production vector store.
 
-## 16. Scaling from 20 docs -> 1M docs -> 100M docs
+**100 million documents:**
+- Sharded storage across multiple nodes.
+- Distributed vector indexes with partition-level approximate search.
+- Multi-stage retrieval: sparse → dense → reranker (each stage reduces candidate count).
+- Asynchronous query pipelines with queuing.
+- Embedding pre-computation with incremental updates.
+- Cache hot queries; use approximate reranking for tail traffic.
 
-- 20 docs: prototype, in-memory BM25, local ChromaDB, full cross-encoder reranking.
-- 1M docs: need persistent inverted index, approximate nearest neighbor search, batch retrieval, and staged reranking.
-- 100M docs: require sharded storage, distributed vector indexes, asynchronous query pipelines, and multi-stage filtering.
+---
 
-## 17. How production RAG differs from this assignment
+## 8. Production monitoring metrics
 
-- Production systems often separate retrieval and generation services.
-- They use enterprise vector stores and indexing infrastructure.
-- They apply stronger access control, monitoring, and auditability.
-- They support dynamic index updates, caching, and load balancing.
-- They often use prompt templates or retrieval-augmented generative models rather than pure extractive QA.
+A production RAG system needs continuous observability:
 
-## 18. Common interview questions and answers
+| Metric | Why it matters |
+|---|---|
+| Query latency (p50, p95, p99) | User experience; SLA compliance |
+| Retrieval hit rate | % of queries where the correct document appears in top-k |
+| Confidence level distribution | Monitor drift in HIGH/MEDIUM/LOW ratios — sudden drop signals corpus staleness |
+| Corrective retrieval rate | High rate means the corpus or query patterns have changed |
+| Answer fallback rate | % of queries returning "Insufficient evidence" — inverse proxy for system coverage |
+| Reranker score distribution | Sudden shift in score ranges signals model drift or query distribution shift |
+| Span extraction success rate | % of queries producing a specific answer span vs full-chunk fallback |
+| End-to-end answer quality (sample) | Periodic human evaluation on random samples |
+
+---
+
+## 9. Retrieval failure examples
+
+### A — BM25 succeeds, vector fails
+**Query:** `"expense form EXP-2024-REV3"`  
+BM25 matches the exact alphanumeric code (`EXP-2024-REV3`) via term lookup. Vector search compresses the code into an embedding that loses its distinguishing structure. **Lesson:** BM25 is irreplaceable for proper nouns, codes, and identifiers.
+
+### B — Vector succeeds, BM25 fails
+**Query:** `"time away from the office regulations"`  
+BM25 tokenises to `["time", "away", "office", "regulations"]` — none of these match "leave policy" verbatim. The vector embedding of "time away from office" is semantically close to "leave policy" because the model has learned that both describe workplace absence. **Lesson:** Dense retrieval handles synonymy and paraphrase that BM25 cannot.
+
+### C — Hybrid succeeds where either alone fails
+**Query:** `"remote work approval and expense reimbursement"`  
+Query decomposition produces two subqueries. BM25 retrieves `remote_work_policy` for subquery 1 and `expense_reimbursement` for subquery 2. Vector retrieval confirms both. RRF fusion surfaces both documents with high confidence. **Lesson:** Multi-topic queries require hybrid retrieval plus query decomposition to surface all relevant documents.
+
+---
+
+## 10. Common interview questions — foundational
 
 1. **What is the primary benefit of hybrid retrieval?**
-   Hybrid retrieval leverages both lexical and semantic signals, improving recall and reducing reliance on a single retrieval modality.
+   Hybrid retrieval leverages lexical precision (BM25) and semantic generalisation (vector), improving recall across query types while maintaining precision via reranking.
 
 2. **How does RRF work?**
-   RRF uses reciprocal rank scores from multiple retrieval lists to combine results, giving higher fused score to candidates ranked well by multiple systems.
+   RRF computes `score += 1/(k + rank)` for each system. Documents ranked well by both systems receive additive boosts. It is scale-invariant — it uses only ranks, not raw scores from heterogeneous systems.
 
 3. **Why use a cross-encoder instead of a bi-encoder for reranking?**
-   Cross-encoders model interactions between the query and text directly, yielding higher accuracy on ranking smaller candidate sets.
+   Cross-encoders jointly encode the query-document pair, enabling full token-level attention interaction. Bi-encoders encode independently. Cross-encoders yield significantly higher ranking accuracy at the cost of O(n) inference calls.
 
 4. **What is an extractive QA model's limitation?**
-   It can only answer questions whose answer exists verbatim or near-verbatim in the context; it cannot generate novel summaries.
+   It can only return spans that exist verbatim or near-verbatim in the context. It cannot generate summaries, reason across non-contiguous passages, or answer questions where the answer is implicit.
 
 5. **Why is query transformation important?**
-   Transforming a compound query into subqueries improves retrieval focus and reduces confusion in ranking and answer extraction.
+   Users write queries in different vocabularies than documents. Acronym expansion (MFA → multi-factor authentication), synonym normalisation, and typo correction bridge the vocabulary gap before retrieval begins.
 
-6. **How is retrieval confidence computed?**
-   Confidence is computed as an average of reranker relevance scores, which indicates the quality of the top-ranked candidates.
+6. **How should confidence be computed for cross-encoder scores?**
+   Not by averaging — cross-encoder scores are ranking scores whose absolute values vary by model. The correct signals are: (1) top score (absolute relevance), (2) score margin (certainty gap to second result), (3) retrieval agreement (did multiple independent methods find this document?).
 
 7. **What is a corrective retrieval loop?**
-   It is a second retrieval pass triggered when initial results are low confidence, often using query expansion or broader search.
+   A second retrieval pass triggered when initial confidence is low. It tries alternate query formulations (synonym expansion, simplification, broader depth) and adopts results only if they improve the top reranker score.
 
 8. **Why not rerank all retrieved chunks?**
-   Reranking is expensive, so it is applied only to a short candidate list after retrieval fusion.
+   Cross-encoders require one inference call per candidate pair. Reranking scales as O(n) in inference calls — running it over the full corpus would be prohibitively slow. Retrieval acts as a fast filter to reduce candidates to a manageable size.
 
 9. **How do you ground answers with citations?**
-   By returning the source document and chunk id for the selected answer span, allowing users to verify evidence.
+   The extractive QA model returns the source document ID and chunk ID for the selected answer span. The UI displays this as a citation, allowing users to verify the answer against the original source.
 
-10. **What is the role of BM25 here?**
-    BM25 supplies a lexical signal that is especially strong for keyword-specific questions.
+10. **What would you monitor in production?**
+    Query latency percentiles, confidence level distribution, corrective retrieval rate, answer fallback rate, reranker score distribution, end-to-end answer quality via periodic human evaluation.
 
-11. **What would you monitor in a production retrieval system?**
-    Latency, hit rate, reranker performance, query distribution, and fallback frequency.
+---
 
-12. **How can you extend this system to support PDFs?**
-    Add a loader for PDF files, convert pages to text, and chunk them similarly before indexing.
+## 11. Advanced interview questions — reranking
 
-13. **Why is local execution valuable in interviews?**
-    It demonstrates end-to-end ownership, reproducibility, and the ability to manage models and indexing without black-box APIs.
+11. **Why does cross-encoder reranking improve over BM25/vector at the top of the ranking?**
+    BM25 and vector retrieval use independent encodings that do not model direct query-document interaction. A cross-encoder reads the full concatenated [query; document] pair, letting every query token attend to every document token. This joint interaction captures relevance signals that independent encodings miss — for example, the query term appearing in a specific negated context in the document.
 
-14. **How would you improve synonym coverage?**
-    Use a small lexical knowledge base, word embeddings, or offline thesaurus expansion rather than relying on a single dictionary.
+12. **What is the distillation trade-off when replacing a cross-encoder with a bi-encoder for speed?**
+    A distilled bi-encoder (e.g., trained to mimic cross-encoder scores) loses ~5–15% in NDCG@10 on standard benchmarks. It reduces inference latency from O(n × model_size) to O(1) per query (the query is embedded once, then compared via fast ANN). The right choice depends on the latency budget: below 50ms SLAs typically require bi-encoders; above 200ms can afford cross-encoders.
 
-15. **What are the tradeoffs of using a larger reranker?**
-    Better ranking quality at higher latency and memory cost.
+13. **How would you evaluate whether your reranker is actually helping?**
+    Compare NDCG@1, NDCG@5, MRR, and Precision@k before and after reranking on a held-out labelled query set. Also measure the rank correlation between pre-rerank and post-rerank orderings — low correlation with high NDCG improvement indicates the reranker is doing real work, not just confirming retrieval order.
 
-16. **What is the difference between retrieval and generation?**
-    Retrieval finds relevant evidence; generation produces natural language, often conditioned on the retrieved evidence.
+14. **What is the failure mode of reranking with a small candidate pool?**
+    If the correct document is not in the pre-rerank candidate pool, the reranker cannot surface it — it can only reorder what it receives. This is why retrieval recall (not precision) is the critical first-stage metric. You want the correct document in the top-20 retrieved, not necessarily at rank 1.
 
-17. **Why not rely on a generative model for answers?**
-    Generative models can hallucinate; extractive QA maintains stronger evidence alignment.
+---
 
-18. **How can you measure if reranking helps?**
-    Compare precision@k and recall@k before and after reranking on labeled queries.
+## 12. Advanced interview questions — hybrid search
 
-19. **What could cause low retrieval confidence?**
-    Ambiguous queries, poor candidate quality, or missing coverage in the document collection.
+15. **Why is BM25's k parameter important for hybrid systems?**
+    The k₁ parameter in BM25 Okapi controls term frequency saturation (typically 1.2–2.0). Low k₁ means additional occurrences of a term provide diminishing returns quickly. For hybrid systems, k₁ affects the relative weight BM25 gives to term frequency vs document frequency — misconfigured k₁ can cause BM25 scores to be dominated by a single high-frequency term.
 
-20. **Why is query expansion useful?**
-    It helps cover synonyms and alternate phrasing that initial retrieval missed.
+16. **When does RRF fail and what would you use instead?**
+    RRF can fail when one retrieval system consistently produces irrelevant results at high rank — those results get undeserved boosts. Weighted RRF (assigning different weights to BM25 vs vector contributions) or learned rank fusion (using a small neural network trained on query-relevance labels) can address this. However, both require labelled data, which RRF does not.
 
-21. **How do you handle negation in retrieval?**
-    Query parsing should preserve negation terms and avoid oversimplifying the question when splitting or expanding.
+17. **How do you handle embedding model staleness in production?**
+    If new documents use vocabulary the embedding model hasn't seen, their embeddings may not align well with query embeddings. Mitigations: (1) periodic model fine-tuning on domain data, (2) monitoring OOV token rate in incoming queries, (3) BM25 as a safety net for exact keyword queries that don't depend on embeddings.
 
-22. **What is the downside of simple rule-based query transformation?**
-    It can over-split or miss complex semantic structure.
+---
 
-23. **How should you handle an unanswered question?**
-    Return an explicit fallback such as "Insufficient evidence found in retrieved documents." and avoid fabricating responses.
+## 13. Advanced interview questions — confidence scoring
 
-24. **What metrics matter for QA evaluation?**
-    Exact match, F1 score, answer recall, and human verification of citation correctness.
+18. **Why is score margin more informative than raw score for retrieval confidence?**
+    A large margin (e.g., top=3.98, second=-10.2, margin=14.18) indicates the retrieval is unambiguous — one document is clearly the best match. A small margin (e.g., top=1.5, second=1.3, margin=0.2) indicates the top two candidates are nearly equally relevant, meaning retrieval could easily have ranked them differently with a slightly different query or document representation.
 
-25. **Why use ChromaDB instead of raw embeddings?**
-    ChromaDB provides persistence, efficient similarity search, and integration with vector retrieval APIs.
+19. **How do you calibrate confidence thresholds for a new document corpus?**
+    Collect a set of labelled queries with known-correct documents. For each query, record the top reranker score and score margin. Plot the distribution of scores for correct vs incorrect top results. Set the HIGH threshold where precision is acceptably high (e.g., >90%), MEDIUM where precision is acceptable for fallback responses, and LOW where you'd rather not answer than risk incorrect information.
 
-26. **How would you scale QA for 100 million documents?**
-    Use document filtering, sparse retrieval, approximate nearest neighbors, and a multi-stage reranking pipeline.
+20. **What does retrieval agreement (BM25 + vector both finding the same document) signal?**
+    Two independently operating retrieval systems using different information — lexical overlap vs semantic similarity — arriving at the same answer is strong evidence of relevance. It's analogous to independent corroboration in hypothesis testing. A document that satisfies both a keyword constraint and a semantic similarity constraint is more likely to be the correct answer than one satisfying only one.
 
-27. **What is the effect of chunk size on retrieval?**
-    Small chunks increase precision but may lose context; large chunks increase recall but may dilute relevance.
+---
 
-28. **How do you preserve chunk metadata?**
-    Store document IDs and chunk IDs in the vector store metadata and include them in results.
+## 14. Advanced interview questions — corrective retrieval
 
-29. **What is the role of the embedding model?**
-    It maps text to dense vectors that capture semantic similarity for vector retrieval.
+21. **What are the risks of query expansion in corrective retrieval?**
+    (1) Semantic drift: adding synonyms can promote documents that are thematically related but not topically relevant. (2) Term pollution: adding many terms reduces BM25 IDF scores for all query terms. (3) Latency: each corrective attempt roughly doubles retrieval compute. Mitigations: expand conservatively, adopt only if improvement is strict, limit strategy count.
 
-30. **How can this system be productionized?**
-    Add automated ingestion, versioned indexes, API endpoints, monitoring, caching, and a distributed retrieval architecture.
+22. **How would you implement a query-difficulty predictor to avoid unnecessary corrective retrieval?**
+    Train a small classifier on (query embedding, document collection statistics) → predicted confidence level. Features: query length, OOV rate, query-corpus vocabulary overlap, syntactic complexity. If the predictor flags a query as "likely low confidence", pre-emptively use broader retrieval depth on the first attempt rather than a second pass.
+
+---
+
+## 15. Advanced interview questions — evaluation metrics
+
+23. **What is the difference between MRR, NDCG, and Recall@k, and when would you use each?**
+    - **MRR** (Mean Reciprocal Rank): average of 1/rank of the first relevant document. Best when only the top-1 result matters (e.g., single-document QA).
+    - **NDCG@k** (Normalised Discounted Cumulative Gain): rewards highly relevant documents at higher positions. Best for ranked lists where multiple documents can be relevant at different grades.
+    - **Recall@k**: fraction of relevant documents appearing in the top-k. Best for measuring retrieval coverage — critical for the first-stage retrieval where recall matters more than precision.
+
+24. **How would you build a QA evaluation dataset for this system without human annotation?**
+    (1) Generate synthetic QA pairs from documents using an LLM (question from a passage, answer = the passage). (2) Use existing HR/policy QA benchmarks if available. (3) LLM-as-judge: use a larger model to rate answer quality for sampled queries. (4) Consistency checking: ask the same question multiple ways and flag when answers differ significantly.
+
+25. **What is the RAGAS framework and how would you apply it here?**
+    RAGAS (Retrieval Augmented Generation Assessment) measures: **faithfulness** (is the answer grounded in retrieved context?), **answer relevance** (does the answer address the question?), **context precision** (how much of the retrieved context is actually used?), and **context recall** (does retrieved context cover the answer?). Here, faithfulness is high by design (extractive QA) but answer relevance can fail when span extraction misidentifies the span.
+
+---
+
+## 16. How production RAG differs from this assignment
+
+- Production systems separate ingestion, retrieval, and generation into independent services.
+- Enterprise vector stores (Pinecone, Weaviate, Qdrant) provide horizontal scaling, RBAC, and versioned indexes.
+- Production pipelines apply stronger access control, query logging, and auditability.
+- Dynamic index updates (new documents added without full re-index) require incremental embedding + upsert pipelines.
+- Response caching, query routing (route simple queries to fast paths, complex to deep pipelines), and circuit breakers are essential.
+- Monitoring systems emit custom metrics to Datadog/Prometheus and trigger alerts on confidence drift, latency regression, and fallback rate increases.
+- A/B testing infrastructure compares pipeline variants on live traffic before promotion.

@@ -53,8 +53,8 @@ def run_evaluation() -> None:
             vector_results = vector.retrieve(subquery)
             fused = reciprocal_rank_fusion(bm25_results, vector_results)
             reranked = reranker.rerank(subquery, fused)
-            top_score, score_margin, confidence_level, needs_correction = grade_retrieval(reranked)
-            answer = qa.answer_question(subquery, reranked) if confidence_level != "LOW" else {
+            top_score, score_margin, confidence_level, needs_correction, reason = grade_retrieval(reranked)
+            answer = qa.answer_question(subquery, reranked, fallback_to_context=(confidence_level != "LOW")) if confidence_level != "LOW" else {
                 "answer": "Insufficient evidence found in retrieved documents.",
                 "score": 0.0, "source_doc": None, "chunk_id": None,
             }
@@ -64,6 +64,7 @@ def run_evaluation() -> None:
                 "top_score": top_score,
                 "score_margin": score_margin,
                 "confidence_level": confidence_level,
+                "confidence_reason": reason,
                 "needs_correction": needs_correction,
                 "answer": answer["answer"],
                 "citation": f"{answer.get('source_doc')} | {answer.get('chunk_id')}" if answer.get("source_doc") else "None",
