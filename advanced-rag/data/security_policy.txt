@@ -1,0 +1,1 @@
+All corporate systems must be protected by multi-factor authentication and strong passwords. Sensitive data must be encrypted at rest and in transit. Employees should report phishing attempts immediately and only use company-approved collaboration tools for sharing confidential information.

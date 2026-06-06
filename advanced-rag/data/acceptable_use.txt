@@ -1,0 +1,1 @@
+Company devices and systems are intended for business use. Personal use should be limited and must not violate acceptable use standards. Software installation requires approval from IT, and employees may not disable endpoint protections or bypass monitoring controls.
