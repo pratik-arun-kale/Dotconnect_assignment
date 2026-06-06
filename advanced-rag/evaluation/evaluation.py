@@ -7,7 +7,6 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from config import CONFIDENCE_THRESHOLD
 from ingestion.build_index import main as build_index
 from ingestion.chunker import Chunker
 from ingestion.loader import DocumentLoader
@@ -54,12 +53,17 @@ def run_evaluation() -> None:
             vector_results = vector.retrieve(subquery)
             fused = reciprocal_rank_fusion(bm25_results, vector_results)
             reranked = reranker.rerank(subquery, fused)
-            confidence, needs_correction = grade_retrieval(reranked)
-            answer = qa.answer_question(subquery, reranked)
+            top_score, score_margin, confidence_level, needs_correction = grade_retrieval(reranked)
+            answer = qa.answer_question(subquery, reranked) if confidence_level != "LOW" else {
+                "answer": "Insufficient evidence found in retrieved documents.",
+                "score": 0.0, "source_doc": None, "chunk_id": None,
+            }
             results.append({
                 "query": query,
                 "subquery": subquery,
-                "confidence": confidence,
+                "top_score": top_score,
+                "score_margin": score_margin,
+                "confidence_level": confidence_level,
                 "needs_correction": needs_correction,
                 "answer": answer["answer"],
                 "citation": f"{answer.get('source_doc')} | {answer.get('chunk_id')}" if answer.get("source_doc") else "None",
